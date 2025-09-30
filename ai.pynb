@@ -1,0 +1,90 @@
+import os
+import pandas as pd
+from sqlalchemy import create_engine
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from langchain.llms import HuggingFacePipeline
+from langchain.vectorstores import FAISS
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+
+# ----------------------------
+# 1. HF Authentication
+# ----------------------------
+os.environ["HUGGINGFACEHUB_API_TOKEN"] = "your_hf_token_here"
+
+# ----------------------------
+# 2. Load Free Hugging Face Model
+# ----------------------------
+MODEL_ID = "HuggingFaceH4/zephyr-7b-beta"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, device_map="auto")
+
+hf_pipeline = pipeline("text-generation", model=model, tokenizer=tokenizer, max_new_tokens=512)
+llm = HuggingFacePipeline(pipeline=hf_pipeline)
+
+# ----------------------------
+# 3. Load CSV into Pandas + "Database"
+# ----------------------------
+csv_path = "your_data.csv"   # replace with your uploaded CSV
+df = pd.read_csv(csv_path)
+
+# Save as SQLite DB (so AI can query like SQL)
+engine = create_engine("sqlite:///csv_data.db")
+df.to_sql("data", engine, index=False, if_exists="replace")
+
+from langchain.sql_database import SQLDatabase
+from langchain.chains import SQLDatabaseChain
+
+db = SQLDatabase(engine)
+sql_chain = SQLDatabaseChain.from_llm(llm, db, verbose=True)
+
+# ----------------------------
+# 4. Build FAISS Vector Store (for text-based analysis)
+# ----------------------------
+# Convert CSV rows into text docs
+texts = [row.to_json() for _, row in df.iterrows()]
+
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+vector_store = FAISS.from_texts(texts, embedding=embeddings)
+retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+
+prompt_template = """
+You are an intelligent data analyst.
+Use the following context from a CSV file to answer the user query.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer clearly:
+"""
+prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    retriever=retriever,
+    chain_type_kwargs={"prompt": prompt}
+)
+
+# ----------------------------
+# 5. Agent Logic
+# ----------------------------
+def csv_agent(query: str):
+    """
+    If question looks like SQL/aggregate → use SQLDatabaseChain
+    Otherwise → use FAISS retrieval
+    """
+    if any(word in query.lower() for word in ["average", "sum", "count", "group", "max", "min", "top", "show rows"]):
+        return sql_chain.run(query)
+    else:
+        return qa_chain.run(query)
+
+# ----------------------------
+# 6. Example Usage
+# ----------------------------
+print(csv_agent("What is the average sales amount?"))
+print(csv_agent("Summarize the dataset in simple words."))
+print(csv_agent("Which product had the highest sales?"))
